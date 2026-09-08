@@ -13,18 +13,15 @@ Detection order per section:
   - relisted: a "'''Relisted''', see [[NewLogPage#NewHeading]]" pointer
     moves tracking to the new section and drops the old one. Reported as "relisted" until the
     section it lands on picks up a real edit.
-  - otherwise: MediaWiki auto-prefixes a section edit's summary with the
-    heading (rendered as "→Heading:" on history
-    pages) -- the newest revision whose comment carries that marker is
-    taken as the section's last-changed time and reported as "updated".
-    A nom's creation never carries this marker (the
-    nomination tool writes its own summary), so a section with no
-    matching revision yet is reported as "created" timestamped from a wiki-signature: either the one
-    Twinkle appends to its own log line, or, for anything not self-nommed
-    (e.g. subscribed to via the log page's [subscribe] button), the
-    nominator's own signature in the section (always the first one there,
-    since replies come after). If neither exists, it's reported as
-    "added" from the current time.
+  - otherwise: every wiki-signature timestamp in the section is found directly (no state to
+    persist), and the newest one is compared against what's already on record -- catching a
+    real edit regardless of what tool made it, since some (e.g. XfD vote-listing scripts)
+    don't produce MediaWiki's usual "/* Heading */" auto-summary that a comment-based check
+    alone would depend on. Reported as "updated", timestamped from that marker when the
+    responsible edit happens to have one, else from the signature itself. A section with no
+    prior record and only one signature is reported as "created" from it instead (more than
+    one means real activity already exists beyond the nomination, so it's "updated" even the
+    first time); with no signature at all, it's "added" from now.
 
 The page is sorted newest-change-first.
 
@@ -54,8 +51,8 @@ CONTACT_URL = f"https://en.wikipedia.org/wiki/User:{BOT_USERNAME}"
 READ_THROTTLE_SECONDS = 0.5
 
 SUBSCRIBERS_PAGE = "User:Rusabot/RfD subscribers"
-EXPIRY_DAYS = 49  # 50 distinct calendar days (0..49) can't exceed action=query's 50-title titles= limit
-MAX_RELIST_HOPS = 10  # guards a malformed or circular chain of relist pointers
+EXPIRY_DAYS = 49  # don't exceed action=query's 50 titles= limit
+MAX_RELIST_HOPS = 10
 
 MONTH_NAMES = [
     "January", "February", "March", "April", "May", "June",
@@ -109,19 +106,26 @@ def parse_subscribers(wikitext: Optional[str]) -> List[str]:
     return [m.group(1) for m in SUBSCRIBER_RE.finditer(wikitext)]
 
 
+def find_signature_times(text: str) -> List[str]:
+    """Every wiki-signature timestamp in text, in document order (oldest first, since replies
+    are appended below earlier ones per standard discussion convention), as ISO 8601. Locale-
+    independent like parse_log_date -- wiki signatures are always English regardless of locale."""
+    times = []
+    for m in WIKI_SIGNATURE_TIME_RE.finditer(text):
+        hour, minute, day, month_str, year = m.groups()
+        try:
+            month = MONTH_NAMES.index(month_str) + 1
+            dt = datetime(int(year), month, int(day), int(hour), int(minute), tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        times.append(dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    return times
+
+
 def parse_wiki_timestamp(text: str) -> Optional[str]:
-    """"04:25, 6 September 2026 (UTC)" -> ISO 8601, or None. Locale-independent like
-    parse_log_date -- wiki signatures are always English regardless of the runtime locale."""
-    m = WIKI_SIGNATURE_TIME_RE.search(text)
-    if not m:
-        return None
-    hour, minute, day, month_str, year = m.groups()
-    try:
-        month = MONTH_NAMES.index(month_str) + 1
-        dt = datetime(int(year), month, int(day), int(hour), int(minute), tzinfo=timezone.utc)
-    except ValueError:
-        return None
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    """The first wiki-signature timestamp in text (e.g. Twinkle's own log-line signature), or None."""
+    times = find_signature_times(text)
+    return times[0] if times else None
 
 
 def parse_self_noms(wikitext: str) -> List[Dict[str, str]]:
@@ -429,19 +433,36 @@ def check_for_updates(site: "pywikibot.site.APISite", subs: Dict[str, Dict[str, 
             notable = True
             continue
 
-        if event_time and event_time != sub["last_change"]:
-            sub["last_change"] = event_time
-            sub["last_kind"] = "updated"
+        signatures = find_signature_times(section_text)
+
+        if not sub["last_kind"]:
+            # Never resolved yet. More than one signature already present (e.g. subscribed via
+            # the button to an already-active discussion) means real activity beyond the
+            # nomination -- report "updated", using the latest one, rather than "created".
+            if len(signatures) > 1:
+                sub["last_change"] = event_time or signatures[-1]
+                sub["last_kind"] = "updated"
+            elif signatures:
+                sub["last_change"] = signatures[0]
+                sub["last_kind"] = "created"
+            else:
+                sub["last_change"] = now_iso()
+                sub["last_kind"] = "added"
             changed = True
-            notable = True
-        elif not sub["last_kind"]:
-            # Never resolved yet. The nominator's own signature is always first in a freshly
-            # nominated section (replies come after), so it's the real creation time if
-            # found; otherwise fall back to now, labeled "added" since then we don't know when.
-            signed_time = parse_wiki_timestamp(section_text)
-            sub["last_change"] = signed_time or now_iso()
-            sub["last_kind"] = "created" if signed_time else "added"
-            changed = True
+        elif signatures:
+            latest = signatures[-1]
+            # Compare at minute precision: history-derived timestamps (event_time,
+            # last_relist_time) carry seconds a wiki signature never can, so exact string
+            # equality would look like a fresh change every time right after a relist or close.
+            if latest[:16] != (sub["last_change"] or "")[:16]:
+                # A newer signature exists -- some tool (e.g. an XfD vote-listing script)
+                # may not produce MediaWiki's auto section-comment marker for event_time to
+                # find, so this is what actually catches the change; event_time just gives a
+                # more precise timestamp for it when the responsible edit happens to have one.
+                sub["last_change"] = event_time or latest
+                sub["last_kind"] = "updated"
+                changed = True
+                notable = True
 
     return changed, notable
 
