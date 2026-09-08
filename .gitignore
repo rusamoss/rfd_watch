@@ -5,3 +5,4 @@ apicache/
 throttle.ctrl
 __pycache__/
 *.pyc
+logs/
