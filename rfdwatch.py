@@ -366,18 +366,22 @@ def resolve_relist_chain(
     return log_page, anchor, section_text, was_relisted, last_relist_time
 
 
-def check_for_updates(site: "pywikibot.site.APISite", subs: Dict[str, Dict[str, str]]) -> bool:
-    """Mutates `subs` in place and returns True if anything changed -- safe here since there's
-    only one page and one edit per user, so it either fully lands or fully doesn't."""
+def check_for_updates(site: "pywikibot.site.APISite", subs: Dict[str, Dict[str, str]]) -> Tuple[bool, bool]:
+    """Mutates `subs` in place. Returns (changed, notable) -- safe to mutate directly since
+    there's only one page and one edit per user, so it either fully lands or fully doesn't.
+    "notable" is False when the only changes were "created"/"added" states: the subscriber
+    already knows about those (they made the nom or subscribed themselves), so callers can
+    use it to mark a save minor when nothing worth seeing on a watchlist actually happened."""
     keys = [key for key, s in subs.items() if not is_closed(s)]
     if not keys:
-        return False
+        return False, False
 
     log_pages = list(dict.fromkeys(subs[key]["log_page"] for key in keys))  # unique, order-preserving
     by_content = get_wikitext_batch(site, log_pages)
     by_history = {page: get_history(site, page) for page in log_pages}
 
     changed = False
+    notable = False
     for key in keys:
         sub = subs[key]
         wikitext = by_content.get(sub["log_page"])
@@ -412,6 +416,7 @@ def check_for_updates(site: "pywikibot.site.APISite", subs: Dict[str, Dict[str, 
             sub["last_kind"] = f"closed:{close_result}"
             subs[new_key] = sub
             changed = True
+            notable = True
             continue
 
         if was_relisted:
@@ -421,12 +426,14 @@ def check_for_updates(site: "pywikibot.site.APISite", subs: Dict[str, Dict[str, 
             sub["last_kind"] = "relisted"
             subs[new_key] = sub
             changed = True
+            notable = True
             continue
 
         if event_time and event_time != sub["last_change"]:
             sub["last_change"] = event_time
             sub["last_kind"] = "updated"
             changed = True
+            notable = True
         elif not sub["last_kind"]:
             # Never resolved yet. The nominator's own signature is always first in a freshly
             # nominated section (replies come after), so it's the real creation time if
@@ -436,7 +443,7 @@ def check_for_updates(site: "pywikibot.site.APISite", subs: Dict[str, Dict[str, 
             sub["last_kind"] = "created" if signed_time else "added"
             changed = True
 
-    return changed
+    return changed, notable
 
 
 def process_user(site: "pywikibot.site.APISite", username: str, retries_left: int = 1) -> None:
@@ -447,7 +454,7 @@ def process_user(site: "pywikibot.site.APISite", username: str, retries_left: in
 
     added = discover_self_noms(subs, xfd_log_page.text if xfd_log_page.exists() else None)
     pruned = prune_expired(subs)
-    changed = check_for_updates(site, subs)
+    changed, notable = check_for_updates(site, subs)
 
     if not (added or pruned or changed):
         print(f"[info] {username}: nothing to update", file=sys.stderr)
@@ -459,8 +466,10 @@ def process_user(site: "pywikibot.site.APISite", username: str, retries_left: in
     # hand-editing their own list) raises EditConflictError instead of
     # being silently overwritten.
     subscriptions_page.text = serialize_subscriptions(subs)
+    # Minor unless something notable happened (relist/close/reply) -- a new self-nom or an
+    # expired prune isn't news to the subscriber, so it's minor-hideable from their watchlist.
     try:
-        subscriptions_page.save(summary="Updating RfD subscriptions", bot=True, minor=False, apply_cosmetic_changes=False)
+        subscriptions_page.save(summary="Updating RfD subscriptions", bot=True, minor=not notable, apply_cosmetic_changes=False)
     except pywikibot.exceptions.EditConflictError:
         if retries_left > 0:
             process_user(site, username, retries_left - 1)
