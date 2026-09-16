@@ -490,7 +490,12 @@ def process_user(site: "pywikibot.site.APISite", username: str, retries_left: in
     # Minor unless something notable happened (relist/close/reply) -- a new self-nom or an
     # expired prune isn't news to the subscriber, so it's minor-hideable from their watchlist.
     try:
-        subscriptions_page.save(summary="Updating RfD subscriptions", bot=True, minor=not notable, apply_cosmetic_changes=False)
+        subscriptions_page.save(
+            summary="Updating RfD subscriptions ([[Wikipedia:Bots/Requests for approval/Rusabot 2|BRFA]])",
+            bot=True,
+            minor=not notable,
+            apply_cosmetic_changes=False,
+        )
     except pywikibot.exceptions.EditConflictError:
         if retries_left > 0:
             process_user(site, username, retries_left - 1)
