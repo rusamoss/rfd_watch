@@ -35,6 +35,7 @@ key moves) would look "new" again every run and get endlessly re-relisted.
 import os
 import re
 import sys
+import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -64,8 +65,10 @@ SUBSCRIBER_RE = re.compile(r"^\*+\s*\[\[\s*[Uu]ser\s*:\s*([^\]|#]+?)\s*[\]|]", r
 
 # Matches one Twinkle XfD-log line for an RfD nomination, e.g.:
 # # [[:'Two Suns of Japan']]: [[Wikipedia:Redirects for discussion/Log/2025 March 27#'Two Suns of Japan'|nominated]] at [[WP:RFD|RfD]]; ...
+# A bundled nomination lists more targets before the colon, e.g. "[[:A]]; [[:B]]: [[...|nominated]]..."
+# -- group 1 (used as the display title) is just the first one, since they share one log_page/anchor.
 SELF_NOM_RE = re.compile(
-    r"^#\s*\[\[:([^\]|]+)(?:\|[^\]]*)?\]\]:\s*"
+    r"^#\s*\[\[:([^\]|]+)(?:\|[^\]]*)?\]\](?:;\s*\[\[:[^\]|]+(?:\|[^\]]*)?\]\])*:\s*"
     r"\[\[(Wikipedia:Redirects for discussion/Log/[^#\]|]+)#([^\]|]+)\|nominated\]\]\s*at\s*\[\[WP:RFD\|RfD\]\]",
     re.MULTILINE,
 )
@@ -520,8 +523,8 @@ def main() -> None:
     for username in usernames:
         try:
             process_user(site, username)
-        except Exception as exc:  # one subscriber's failure must not stop the rest
-            print(f"[error] {username}: {exc}", file=sys.stderr)
+        except Exception:  # one subscriber's failure must not stop the rest
+            print(f"[error] {username}:\n{traceback.format_exc()}", file=sys.stderr)
 
 
 if __name__ == "__main__":
