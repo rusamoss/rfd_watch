@@ -90,9 +90,13 @@ CLOSE_RESULT_RE = re.compile(r"result of the discussion was.*?'''([^']*)'''", re
 RELIST_RE = re.compile(r"'''Relisted'''.*?\[\[([^\]|]+)\]\]")
 
 # One resolved subscription line looks like:
-# * [[LogPage#Anchor|Title]] — updated 02:56, 6 September 2026 (UTC)<!--last:2026-09-06T02:56:53Z|updated-->
-# An unresolved (never-yet-checked) subscription is just the bare link.
-SUB_LINE_RE = re.compile(r"^\*\s*\[\[([^\]#]+)#([^\]|]+)\|([^\]]+)\]\](?:.*<!--last:([^|>]*)\|([^>]*)-->)?\s*$")
+# * [[LogPage#Anchor|Title]] — updated by [[User:X]] 02:56, 6 September 2026 (UTC)<!--last:2026-09-06T02:56:53Z|updated|X-->
+# An unresolved (never-yet-checked) subscription is just the bare link. The trailing user field is
+# optional in both the display text and the comment, for compatibility with lines written before it
+# existed and for kinds ("created"/"added"/"relisted") that never carry one.
+SUB_LINE_RE = re.compile(
+    r"^\*\s*\[\[([^\]#]+)#([^\]|]+)\|([^\]]+)\]\](?:.*<!--last:([^|>]*)\|([^|>]*)(?:\|([^>]*))?-->)?\s*$"
+)
 
 HEADING_RE = re.compile(r"^====\s*(.+?)\s*====\s*$")
 STOP_RE = re.compile(r"^(===|====)")
@@ -150,9 +154,10 @@ def find_close_result(section_text: str) -> Optional[str]:
         return None
     m = CLOSE_RESULT_RE.search(section_text)
     result = m.group(1).strip() if m else ""
-    # '>' would break the <!--last:...|...--> comment's own [^>]* field on
-    # the next parse, silently dropping the subscription line entirely.
-    result = result.replace(">", "")
+    # '>' would break the <!--last:...|...--> comment's own [^>]* field, and '|' would
+    # be mistaken for the boundary between its kind and user fields -- either would
+    # silently corrupt or drop the subscription line on the next parse.
+    result = result.replace(">", "").replace("|", "")
     return result or "closed"
 
 
@@ -221,16 +226,19 @@ def format_human_time(iso: str) -> str:
     return f"{dt:%H:%M}, {dt.day} {MONTH_NAMES[dt.month - 1]} {dt.year} (UTC)"
 
 
-def phrase_for_kind(kind: str) -> str:
+def phrase_for_kind(kind: str, user: str) -> str:
+    """user is who made the responsible edit -- known only for "updated"/"closed:*" (an
+    editor caught via the section's edit history), never for "created"/"added"/"relisted"
+    (the subscriber's own nomination, their own manual subscribe, or no single editor to
+    credit for a relist pointer)."""
     if kind == "relisted":
         return "relisted"
     if kind == "created":
         return "created"
     if kind == "added":
         return "added"
-    if kind.startswith("closed:"):
-        return "closed as " + kind[len("closed:"):]
-    return "updated"
+    phrase = "closed as " + kind[len("closed:"):] if kind.startswith("closed:") else "updated"
+    return f"{phrase} by [[User:{user}]]" if user else phrase
 
 
 def parse_subscriptions(wikitext: Optional[str]) -> Dict[str, Dict[str, str]]:
@@ -241,13 +249,14 @@ def parse_subscriptions(wikitext: Optional[str]) -> Dict[str, Dict[str, str]]:
         m = SUB_LINE_RE.match(line)
         if not m:
             continue
-        log_page, anchor, title, last_change, last_kind = m.groups()
+        log_page, anchor, title, last_change, last_kind, last_user = m.groups()
         subs[sub_key(log_page, anchor)] = {
             "log_page": log_page,
             "anchor": anchor,
             "title": title,
             "last_change": last_change or "",
             "last_kind": last_kind or "",
+            "last_user": last_user or "",
         }
     return subs
 
@@ -261,9 +270,10 @@ def serialize_subscriptions(subs: Dict[str, Dict[str, str]]) -> str:
         if not s["last_change"]:
             lines.append(f"* {link}")
         else:
-            phrase = phrase_for_kind(s["last_kind"])
+            user = s.get("last_user", "")
+            phrase = phrase_for_kind(s["last_kind"], user)
             human = format_human_time(s["last_change"])
-            lines.append(f"* {link} — {phrase} {human}<!--last:{s['last_change']}|{s['last_kind']}-->")
+            lines.append(f"* {link} — {phrase} {human}<!--last:{s['last_change']}|{s['last_kind']}|{user}-->")
     return "\n".join(lines) + "\n"
 
 
@@ -282,6 +292,7 @@ def discover_self_noms(subs: Dict[str, Dict[str, str]], xfd_log_wikitext: Option
                 "anchor": n["anchor"],
                 "last_change": n["logged_at"],
                 "last_kind": "created" if n["logged_at"] else "",
+                "last_user": "",
             }
             tracked_titles.add(n["title"])
             added = True
@@ -296,14 +307,19 @@ def prune_expired(subs: Dict[str, Dict[str, str]]) -> bool:
     return bool(expired_keys)
 
 
-def find_last_change_for_anchor(history: List[Dict[str, str]], anchor: str) -> Optional[str]:
+def find_last_rev_for_anchor(history: List[Dict[str, str]], anchor: str) -> Optional[Dict[str, str]]:
     """Newest revision (history is newest-first) whose edit summary carries MediaWiki's auto-generated "/* Heading */" section marker."""
     marker = f"/* {anchor} */"
     for rev in history:
         comment = rev.get("comment")
         if comment and marker in comment:
-            return rev["timestamp"]
+            return rev
     return None
+
+
+def find_last_change_for_anchor(history: List[Dict[str, str]], anchor: str) -> Optional[str]:
+    rev = find_last_rev_for_anchor(history, anchor)
+    return rev["timestamp"] if rev else None
 
 
 def get_wikitext_batch(site: "pywikibot.site.APISite", titles: List[str]) -> Dict[str, Optional[str]]:
@@ -316,13 +332,18 @@ def get_wikitext_batch(site: "pywikibot.site.APISite", titles: List[str]) -> Dic
 
 
 def get_history(site: "pywikibot.site.APISite", title: str) -> List[Dict[str, str]]:
-    """Newest-first revision history (timestamp + comment, no content), capped like the JS original's
-    rvlimit=max -- only the newest few revisions are ever needed for a section's last change."""
+    """Newest-first revision history (timestamp + comment + editor, no content), capped like the
+    JS original's rvlimit=max -- only the newest few revisions are ever needed for a section's
+    last change."""
     page = pywikibot.Page(site, title)
     if not page.exists():
         return []
     return [
-        {"timestamp": rev.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ"), "comment": rev.comment or ""}
+        {
+            "timestamp": rev.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "comment": rev.comment or "",
+            "user": rev.user or "",
+        }
         for rev in page.revisions(content=False, total=500)
     ]
 
@@ -373,19 +394,33 @@ def resolve_relist_chain(
     return log_page, anchor, section_text, was_relisted, last_relist_time
 
 
-def check_for_updates(site: "pywikibot.site.APISite", subs: Dict[str, Dict[str, str]]) -> Tuple[bool, bool]:
+def check_for_updates(
+    site: "pywikibot.site.APISite",
+    subs: Dict[str, Dict[str, str]],
+    by_content: Dict[str, Optional[str]],
+    by_history: Dict[str, List[Dict[str, str]]],
+) -> Tuple[bool, bool]:
     """Mutates `subs` in place. Returns (changed, notable) -- safe to mutate directly since
     there's only one page and one edit per user, so it either fully lands or fully doesn't.
     "notable" is False when the only changes were "created"/"added" states: the subscriber
     already knows about those (they made the nom or subscribed themselves), so callers can
-    use it to mark a save minor when nothing worth seeing on a watchlist actually happened."""
+    use it to mark a save minor when nothing worth seeing on a watchlist actually happened.
+
+    by_content/by_history are keyed by log page title and shared across callers for the
+    whole run (see main()) -- subscribers commonly overlap on the same log pages, and
+    nothing in this run ever edits an RfD log page itself, so a page fetched for one
+    subscriber is still correct for the next."""
     keys = [key for key, s in subs.items() if not is_closed(s)]
     if not keys:
         return False, False
 
     log_pages = list(dict.fromkeys(subs[key]["log_page"] for key in keys))  # unique, order-preserving
-    by_content = get_wikitext_batch(site, log_pages)
-    by_history = {page: get_history(site, page) for page in log_pages}
+    uncached_pages = [page for page in log_pages if page not in by_content]
+    if uncached_pages:
+        by_content.update(get_wikitext_batch(site, uncached_pages))
+    for page in log_pages:
+        if page not in by_history:
+            by_history[page] = get_history(site, page)
 
     changed = False
     notable = False
@@ -409,9 +444,11 @@ def check_for_updates(site: "pywikibot.site.APISite", subs: Dict[str, Dict[str, 
             print(f"[warn] {new_key} already tracked; leaving {key} as-is", file=sys.stderr)
             continue
 
-        # The actual on-wiki edit time -- closing is itself a section edit, so this is the
-        # real event time, not just when this script happens to run.
-        event_time = find_last_change_for_anchor(by_history.get(log_page, []), anchor)
+        # The actual on-wiki edit time (and its editor) -- closing is itself a section edit,
+        # so this is the real event, not just when this script happens to run.
+        event_rev = find_last_rev_for_anchor(by_history.get(log_page, []), anchor)
+        event_time = event_rev["timestamp"] if event_rev else None
+        event_user = event_rev["user"] if event_rev else ""
         close_result = find_close_result(section_text)
 
         if new_key != key:
@@ -421,6 +458,7 @@ def check_for_updates(site: "pywikibot.site.APISite", subs: Dict[str, Dict[str, 
         if close_result:
             sub["last_change"] = event_time or last_relist_time or now_iso()
             sub["last_kind"] = f"closed:{close_result}"
+            sub["last_user"] = event_user
             subs[new_key] = sub
             changed = True
             notable = True
@@ -445,6 +483,7 @@ def check_for_updates(site: "pywikibot.site.APISite", subs: Dict[str, Dict[str, 
             if len(signatures) > 1:
                 sub["last_change"] = event_time or signatures[-1]
                 sub["last_kind"] = "updated"
+                sub["last_user"] = event_user
             elif signatures:
                 sub["last_change"] = signatures[0]
                 sub["last_kind"] = "created"
@@ -464,13 +503,20 @@ def check_for_updates(site: "pywikibot.site.APISite", subs: Dict[str, Dict[str, 
                 # more precise timestamp for it when the responsible edit happens to have one.
                 sub["last_change"] = event_time or latest
                 sub["last_kind"] = "updated"
+                sub["last_user"] = event_user
                 changed = True
                 notable = True
 
     return changed, notable
 
 
-def process_user(site: "pywikibot.site.APISite", username: str, retries_left: int = 1) -> None:
+def process_user(
+    site: "pywikibot.site.APISite",
+    username: str,
+    by_content: Dict[str, Optional[str]],
+    by_history: Dict[str, List[Dict[str, str]]],
+    retries_left: int = 1,
+) -> None:
     xfd_log_page = pywikibot.Page(site, f"User:{username}/XfD log")
     subscriptions_page = pywikibot.Page(site, f"User:{username}/RfD subscriptions")
 
@@ -478,7 +524,7 @@ def process_user(site: "pywikibot.site.APISite", username: str, retries_left: in
 
     added = discover_self_noms(subs, xfd_log_page.text if xfd_log_page.exists() else None)
     pruned = prune_expired(subs)
-    changed, notable = check_for_updates(site, subs)
+    changed, notable = check_for_updates(site, subs, by_content, by_history)
 
     if not (added or pruned or changed):
         print(f"[info] {username}: nothing to update", file=sys.stderr)
@@ -501,7 +547,7 @@ def process_user(site: "pywikibot.site.APISite", username: str, retries_left: in
         )
     except pywikibot.exceptions.EditConflictError:
         if retries_left > 0:
-            process_user(site, username, retries_left - 1)
+            process_user(site, username, by_content, by_history, retries_left - 1)
         else:
             print(f"[warn] {username}: edit conflict, giving up after retry", file=sys.stderr)
         return
@@ -520,9 +566,12 @@ def main() -> None:
         print(f"[warn] no subscribers found on {SUBSCRIBERS_PAGE}", file=sys.stderr)
         return
 
+    # Shared across all subscribers this run -- see check_for_updates for why that's safe.
+    by_content: Dict[str, Optional[str]] = {}
+    by_history: Dict[str, List[Dict[str, str]]] = {}
     for username in usernames:
         try:
-            process_user(site, username)
+            process_user(site, username, by_content, by_history)
         except Exception:  # one subscriber's failure must not stop the rest
             print(f"[error] {username}:\n{traceback.format_exc()}", file=sys.stderr)
 
