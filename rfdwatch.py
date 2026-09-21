@@ -283,6 +283,30 @@ def serialize_subscriptions(subs: Dict[str, Dict[str, str]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def build_page_text(original_wikitext: Optional[str], subs: Dict[str, Dict[str, str]]) -> str:
+    """Replaces only the subscription bullet lines with a freshly resorted serialize_subscriptions()
+    block, leaving everything else on the page (a header note, blank lines, ...) exactly as written
+    -- a subscriber's own additions to their page shouldn't get silently wiped on the next bot save.
+    The new block lands at the position of the first original subscription line; all subscription
+    lines (wherever they were) are removed first, so this still works if they weren't contiguous."""
+    new_block = serialize_subscriptions(subs)
+    new_lines = new_block[:-1].split("\n") if subs else []  # [:-1] drops serialize's trailing "\n"
+    if not original_wikitext:
+        return new_block
+    lines = original_wikitext.split("\n")
+    sub_positions = {i for i, line in enumerate(lines) if SUB_LINE_RE.match(line)}
+    if not sub_positions:
+        prefix = original_wikitext if original_wikitext.endswith("\n") else original_wikitext + "\n"
+        return prefix + new_block
+    first = min(sub_positions)
+    kept = [line for i, line in enumerate(lines) if i not in sub_positions]
+    kept[first:first] = new_lines
+    # split() on text ending in "\n" leaves a trailing "" element, so join() alone already
+    # reproduces that trailing newline -- only text that lacked one needs it added back.
+    result = "\n".join(kept)
+    return result if result.endswith("\n") else result + "\n"
+
+
 def discover_self_noms(subs: Dict[str, Dict[str, str]], xfd_log_wikitext: Optional[str]) -> bool:
     """Returns True if anything was added."""
     if not xfd_log_wikitext:
@@ -526,7 +550,8 @@ def process_user(
     xfd_log_page = pywikibot.Page(site, f"User:{username}/XfD log")
     subscriptions_page = pywikibot.Page(site, f"User:{username}/RfD subscriptions")
 
-    subs = parse_subscriptions(subscriptions_page.text if subscriptions_page.exists() else None)
+    original_text = subscriptions_page.text if subscriptions_page.exists() else None
+    subs = parse_subscriptions(original_text)
 
     added = discover_self_noms(subs, xfd_log_page.text if xfd_log_page.exists() else None)
     pruned = prune_expired(subs)
@@ -541,7 +566,7 @@ def process_user(
     # basetimestamp automatically -- a concurrent edit (e.g. the subscriber
     # hand-editing their own list) raises EditConflictError instead of
     # being silently overwritten.
-    subscriptions_page.text = serialize_subscriptions(subs)
+    subscriptions_page.text = build_page_text(original_text, subs)
     # Minor unless something notable happened (relist/close/reply) -- a new self-nom or an
     # expired prune isn't news to the subscriber, so it's minor-hideable from their watchlist.
     try:
