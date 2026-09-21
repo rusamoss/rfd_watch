@@ -250,6 +250,12 @@ def parse_subscriptions(wikitext: Optional[str]) -> Dict[str, Dict[str, str]]:
         if not m:
             continue
         log_page, anchor, title, last_change, last_kind, last_user = m.groups()
+        # MediaWiki treats '_' and ' ' as interchangeable in titles/anchors -- a hand-typed
+        # subscription line (as opposed to one this bot or the subscribe-button gadget wrote)
+        # may use URL-style underscores, which would otherwise never string-match the real
+        # (space-using) heading text in extract_section and silently never resolve.
+        log_page = log_page.replace("_", " ")
+        anchor = anchor.replace("_", " ")
         subs[sub_key(log_page, anchor)] = {
             "log_page": log_page,
             "anchor": anchor,
